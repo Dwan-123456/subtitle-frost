@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "中文字幕实时毛玻璃",
-  "version": "1.6",
+  "version": "1.7",
   "description": "本机识别视频字幕，仅模糊中文行。",
   "browser_specific_settings": {
     "gecko": {

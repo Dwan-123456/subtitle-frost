@@ -203,20 +203,23 @@
                     (right-x)/canvas.width*a.w*r.w,(bottom-y)/canvas.height*a.h*r.h);
             }
         }
-        function excludeEnglish(boxes,guards){
-            let pieces=boxes;
-            for(const [l,t,r,b] of guards){
-                const output=[];
-                for(const q of pieces){
-                    const [x,y,u,w]=q;
-                    const a=Math.max(x,l),c=Math.min(u,r),d=Math.max(y,t),e=Math.min(w,b);
-                    if(a>=c || d>=e){output.push(q);continue;}
-                    for(const p of [[x,y,u,d],[x,e,u,w],[x,d,a,e],[c,d,u,e]])
-                        if(p[2]>p[0] && p[3]>p[1])output.push(p);
-                }
-                pieces=output;
+        function overlap(a,b) {
+            return Math.max(0,Math.min(a[2],b[2])-Math.max(a[0],b[0])) *
+                Math.max(0,Math.min(a[3],b[3])-Math.max(a[1],b[1]));
+        }
+        // Keep a single straight-edged rectangle per Chinese box. For each
+        // English intersection choose the cut that preserves most Chinese ink.
+        function clipEnglish(box,core,guards) {
+            for(const guard of guards) {
+                if(!overlap(box,guard))continue;
+                const [x,y,r,b]=box,[l,t,u,v]=guard;
+                const choices=[[x,y,r,t],[x,v,r,b],[x,y,l,b],[u,y,r,b]]
+                    .filter(q=>q[2]>q[0] && q[3]>q[1] && overlap(q,core)>0);
+                if(!choices.length)return null;
+                choices.sort((a,b)=>overlap(b,core)-overlap(a,core) || overlap(b,b)-overlap(a,a));
+                box=choices[0];
             }
-            return pieces;
+            return box;
         }
         let safeEnglish=[],holdUntil=-Infinity,earlyPlan=null,previousAhead=null;
         function show(snapshot,result,early=false) {
@@ -227,28 +230,19 @@
                 const keys=signature(snapshot,core);
                 if(!early && !stillVisible(snapshot,current,keys))continue;
                 const [x,y,right,bottom]=core;
-                const height=bottom-y;
-                const dx=Math.max(1,Math.round(height*0.10));
-                const dy=Math.max(1,Math.round(height*0.15));
-                const padded=[Math.max(0,x-dx),Math.max(0,y-dy),
-                    Math.min(snapshot.width,right+dx),Math.min(snapshot.height,bottom+dy)];
-                for(const box of excludeEnglish([padded],guards)){
-                    const el=layer("backdrop-filter:blur(16px) brightness(.9);background:rgba(0,0,0,.2);border-radius:4px");
-                    next.push({el,box,keys,snapshot,lastHit:performance.now(),misses:0,checkedTime:previousTime});
-                }
+                const pad=Math.max(1,Math.round((bottom-y)*0.15));
+                const padded=[Math.max(0,x-pad),Math.max(0,y-pad),
+                    Math.min(snapshot.width,right+pad),Math.min(snapshot.height,bottom+pad)];
+                const box=clipEnglish(padded,core,guards);
+                if(!box)continue;
+                const el=layer("backdrop-filter:blur(16px) brightness(.9);background:rgba(0,0,0,.2);border:0;border-radius:0");
+                next.push({el,box,core,keys,snapshot,lastHit:performance.now(),misses:0,checkedTime:previousTime});
             }
-            // Replacing a matched box is atomic. Unmatched parts keep their miss
-            // counters; English protection takes effect even during the grace period.
-            const exclusions=[...guards,...next.map(m=>m.box)];
             const held=[];
             for(const m of masks){
-                const pieces=excludeEnglish([m.box],exclusions);
-                if(pieces.length===1 && pieces[0]===m.box){held.push(m);continue;}
-                m.el.remove();
-                for(const box of pieces){
-                    const el=m.el.cloneNode(false);host().appendChild(el);
-                    held.push({...m,box,el,keys:signature(m.snapshot,box)});
-                }
+                const box=clipEnglish(m.box,m.core,guards);
+                if(!box || next.some(n=>overlap(n.box,m.box)>0)){m.el.remove();continue;}
+                m.box=box;held.push(m);
             }
             masks=[...next,...held];layout();
         }
@@ -264,35 +258,66 @@
                 if(performance.now()-lastCacheAttempt>3000)startCache();
                 return;
             }
-            const step=Math.max(frameDuration,Math.min(.12,period/1000*v.playbackRate));
-            const at=Math.max(frameTime+.40*v.playbackRate,plans.length?plans[plans.length-1].end:0);
+            // Seek to the middle of a source frame, but timestamp its mask at the
+            // frame start. A boundary seek may decode the previous frame.
+            const step=frameDuration;
+            const tail=plans.length?plans[plans.length-1].end:frameTime;
+            const lead=Math.max(.18,.55*v.playbackRate);
+            const framesAhead=Math.max(1,Math.ceil((Math.max(frameTime+lead,tail)-frameTime)/step-0.001));
+            const at=frameTime+framesAhead*step;
+            const sampleTime=at+step/2;
             if(at>frameTime+horizon || preview.readyState<1)return;
             const ranges=preview.buffered;
             if(!Array.from({length:ranges.length},(_,i)=>i).some(i=>ranges.start(i)<=at && ranges.end(i)>at+step))return;
             const generation=epoch;
             preparing=true;
-            const finish=()=>{preparing=false;clearTimeout(timeout);preview.removeEventListener("seeked",ready);};
-            const ready=async()=>{
-                clearTimeout(timeout);
-                if(!active || generation!==epoch || preview.videoWidth!==v.videoWidth){finish();return;}
-                try {
-                    const snapshot=read(preview,aheadCanvas,aheadCtx);
+            function seekSnapshot(target){
+                return new Promise((resolve,reject)=>{
+                    const done=()=>{
+                        clearTimeout(timer);preview.removeEventListener("seeked",ready);
+                    };
+                    const ready=()=>{
+                        done();
+                        try{
+                            if(!active || generation!==epoch || preview.videoWidth!==v.videoWidth)
+                                throw Error("Preview changed");
+                            resolve(read(preview,aheadCanvas,aheadCtx));
+                        }catch(error){reject(error);}
+                    };
+                    const timer=setTimeout(()=>{done();reject(Error("Preview seek timed out"));},900);
+                    preview.addEventListener("seeked",ready,{once:true});
+                    try{preview.currentTime=target;}catch(error){done();reject(error);}
+                });
+            }
+            (async()=>{
+                try{
+                    const snapshot=await seekSnapshot(sampleTime);
                     const prior=previousAhead;
-                    const reuse=prior && at>=prior.at && at-prior.at<.3 && similar(prior.snapshot,snapshot);
+                    const reuse=prior && at>=prior.at && at-prior.ocrTime<.3 && similar(prior.snapshot,snapshot);
                     const result=reuse?prior.result:await recognize(aheadCanvas);
-                    if(active && generation===epoch && !reuse)previousAhead={at,snapshot,result};
-                    if(active && generation===epoch && at+step>v.currentTime){
-                        const keys=result.chinese.map(b=>signature(snapshot,b));
-                        plans.push({start:at,end:at+step,snapshot,result,boxes:result.chinese,keys});
+                    if(!active || generation!==epoch)return;
+                    previousAhead={at,snapshot,result,ocrTime:reuse?prior.ocrTime:at};
+                    const keys=result.chinese.map(b=>signature(snapshot,b));
+                    let start=at;
+                    // Sparse OCR can land several frames into a new subtitle. Find
+                    // its first matching buffered frame before scheduling the lead.
+                    if(keys.length && prior && prior.at<at &&
+                        !keys.every(k=>stillVisible(snapshot,prior.snapshot,k))){
+                        let older=Math.min(12,Math.round((at-prior.at)/step)), newer=0;
+                        while(older-newer>1){
+                            const mid=Math.floor((older+newer)/2);
+                            const probe=await seekSnapshot(at-mid*step+step/2);
+                            if(keys.every(k=>stillVisible(snapshot,probe,k)))newer=mid;
+                            else older=mid;
+                        }
+                        start=at-newer*step;
                     }
-                } catch {
-                    // Cancel speculative work; live frame recognition remains available.
-                    document.dispatchEvent(new Event("subtitle-blur-cache-stop"));
-                } finally {finish();}
-            };
-            const timeout=setTimeout(finish,900);
-            preview.addEventListener("seeked",ready,{once:true});
-            try{preview.currentTime=at;}catch{finish();}
+                    if(active && generation===epoch && at+step>v.currentTime)
+                        plans.push({start,end:at+step,snapshot,result,boxes:result.chinese,keys});
+                }catch{
+                    if(active && generation===epoch)document.dispatchEvent(new Event("subtitle-blur-cache-stop"));
+                }finally{preparing=false;}
+            })();
         }
         async function requestOcr(snapshot) {
             busy=true;lastSent=performance.now();
@@ -314,8 +339,12 @@
         function prearm(time){
             if(!current || v.paused || v.seeking || document.hidden || time<holdUntil)return;
             const upcoming=plans.find(p=>p!==earlyPlan && p.start>time &&
-                p.start-time<=Math.min(.09,2*frameDuration) && p.boxes.length);
-            if(!upcoming || (masks.length && masks.every(m=>stillVisible(m.snapshot,current,m.keys))))return;
+                p.start-time<=2.02*frameDuration && p.boxes.length);
+            if(!upcoming)return;
+            // A continuing line is already covered. A new line can need a
+            // larger rectangle even while the old subtitle is still visible.
+            if(upcoming.boxes.every((b,i)=>stillVisible(upcoming.snapshot,current,upcoming.keys[i]) &&
+                masks.some(m=>overlap(m.box,b)>=overlap(b,b)*.98)))return;
             earlyPlan=upcoming;holdUntil=upcoming.start+frameDuration/2;
             show(upcoming.snapshot,upcoming.result,true);
         }
