@@ -1,0 +1,40 @@
+{
+  "manifest_version": 2,
+  "name": "中文字幕实时毛玻璃",
+  "version": "1.6",
+  "description": "本机识别视频字幕，仅模糊中文行。",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "local-subtitle-blur@local.invalid",
+      "strict_min_version": "128.0"
+    }
+  },
+  "permissions": [
+    "activeTab", "storage",
+    "nativeMessaging"
+  ],
+  "content_scripts": [{
+    "matches": ["https://www.bilibili.com/*"],
+    "js": ["cache.js"],
+    "run_at": "document_start",
+    "world": "MAIN"
+  }],
+  "commands": {
+    "stats": {"suggested_key":{"default":"Alt+Shift+I"},"description":"显示或隐藏 OCR 性能统计"},
+    "reselect": {
+      "suggested_key": {"default": "Alt+Shift+R"},
+      "description": "重新框选并记住本站字幕区域"
+    },
+    "_execute_browser_action": {
+      "suggested_key": {"default": "Alt+Shift+U"}
+    }
+  },
+  "browser_action": {
+    "default_title": "在已记住的字幕横条启动或停止；Alt+Shift+R 重新框选"
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  }
+}
